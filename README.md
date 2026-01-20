@@ -1,4 +1,5 @@
 # YouTube/Bilibili 影片字幕提取與 AI 整理工具 (v3.0)
+<img width="1176" height="1025" alt="image" src="https://github.com/user-attachments/assets/5d90e87c-1ddc-4641-b463-2f97358c306e" />
 
 這是一個強大且適合初學者的工具，可以幫你從 YouTube、Bilibili 等網站下載影片/音訊，並透過 AI (Google Gemini) 自動產生字幕、摘要，還能幫你整理筆記！
 
