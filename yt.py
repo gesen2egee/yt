@@ -1042,6 +1042,18 @@ class YTDLPProcessor:
             print(f"取得影片資訊失敗: {e}")
         return {}
 
+    def get_playlist_urls(self, url: str) -> List[str]:
+        """如果是合輯，展開所有影片網址"""
+        cmd = ["yt-dlp", "--flat-playlist", "--get-id", "--no-warnings", url]
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60)
+            if result.returncode == 0:
+                ids = [line.strip() for line in result.stdout.split('\n') if line.strip()]
+                return [f"https://www.youtube.com/watch?v={vid}" for vid in ids]
+        except Exception as e:
+            print(f"解析合輯失敗: {e}")
+        return []
+
     def has_any_subtitles(self, info: dict) -> bool:
         subs = info.get("subtitles") or {}
         auto = info.get("automatic_captions") or {}
@@ -1963,11 +1975,28 @@ def create_jobs():
     data = request.json or {}
     urls = data.get('urls', [])
 
-    created_jobs = []
+    ytdlp = YTDLPProcessor()
+    all_expanded_urls = []
+    
     for url in urls:
         url = (url or "").strip()
         if not url:
             continue
+            
+        # 偵測是否為合輯 (Playlist)
+        if "list=" in url or "/playlist" in url:
+            print(f"🔗 偵測到合輯網址，正在展開: {url}")
+            playlist_urls = ytdlp.get_playlist_urls(url)
+            if playlist_urls:
+                all_expanded_urls.extend(playlist_urls)
+            else:
+                # 展開失敗則當成一般網址處理
+                all_expanded_urls.append(url)
+        else:
+            all_expanded_urls.append(url)
+
+    created_jobs = []
+    for url in all_expanded_urls:
         job = Job(id=str(uuid.uuid4()), url=url, status="queued", stage="等待中", progress=0)
         data_manager.add_job(job)
         created_jobs.append(asdict(job))
@@ -2818,6 +2847,41 @@ HTML_TEMPLATE = r'''
       .job-item { flex-wrap: wrap; }
       .modal-content { padding: 16px; }
     }
+
+    /* Tooltip 樣式 */
+    .tooltip {
+      position: relative;
+      display: inline-block;
+      cursor: help;
+      margin-left: 4px;
+      color: var(--accent);
+      font-size: 0.9rem;
+    }
+    .tooltip .tooltiptext {
+      visibility: hidden;
+      width: 220px;
+      background-color: var(--bg-card);
+      color: var(--text-primary);
+      text-align: left;
+      border: 1px solid var(--accent);
+      border-radius: 6px;
+      padding: 10px;
+      position: absolute;
+      z-index: 1000;
+      bottom: 125%;
+      left: 50%;
+      margin-left: -110px;
+      opacity: 0;
+      transition: opacity 0.3s;
+      font-size: 0.8rem;
+      font-weight: normal;
+      line-height: 1.4;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+    }
+    .tooltip:hover .tooltiptext {
+      visibility: visible;
+      opacity: 1;
+    }
   </style>
 </head>
 <body>
@@ -3046,14 +3110,18 @@ HTML_TEMPLATE = r'''
       </div>
       <div class="form-row">
         <div class="form-group">
-          <label>音訊分段時長（分鐘）</label>
+          <label>音訊分段時長（分鐘） 
+            <span class="tooltip">ⓘ<span class="tooltiptext">長音訊自動切割。處理第 2 段起會參考前段內容作為上下文，確保連貫性。</span></span>
+          </label>
           <input id="audio-segment-minutes" type="number" step="1" min="0" max="60" placeholder="0 表示不分段">
           <small style="color: var(--text-secondary); font-size: 0.85rem;">超過此時長的音訊將自動切段處理（0 = 不分段）</small>
         </div>
       </div>
       <div class="checkbox-group">
         <input type="checkbox" id="enable-query-repeat">
-        <label for="enable-query-repeat">啟用提詞重複（提升準確度但會加倍 token 使用量）</label>
+        <label for="enable-query-repeat">啟用提詞重複 
+          <span class="tooltip">ⓘ<span class="tooltiptext">將完整的查詢內容(提示詞+音訊)重複發送給 AI，大幅提升準確度，但會使 Token 消耗加倍。</span></span>
+        </label>
       </div>
     </div>
 
@@ -3083,14 +3151,18 @@ HTML_TEMPLATE = r'''
     </div>
     <div id="modal-video-info" class="video-info" style="display:none;"></div>
     <div id="modal-content" class="content-display"></div>
+    <div id="summarize-status-area" style="display:none; margin: 10px 0; padding: 12px; border-radius: 8px; background: rgba(var(--accent-rgb), 0.1); border: 1px solid var(--accent); color: var(--accent); text-align: center; font-weight: bold;">
+      <div class="spinner-small" style="display:inline-block; margin-right:8px;"></div>
+      <span id="summarize-status-text">🚀 Gemini 正在思考中...</span>
+    </div>
     <div class="action-bar">
-      <button id="summarize-btn" class="btn btn-primary" onclick="summarizeContent()">📝 AI 整理</button>
-      <button id="cancel-summarize-btn" class="btn btn-danger" style="display:none;" onclick="cancelSummarize()">⛔ 中斷</button>
-      <button class="btn btn-secondary" onclick="downloadSubtitle()">📄 字幕檔</button>
-      <button class="btn btn-secondary" onclick="copyLlmInput()">📋 複製指令</button>
-      <button class="btn btn-secondary" onclick="downloadAudio()">🎵 音檔</button>
-      <button class="btn btn-secondary" onclick="downloadVideo()">🎬 影片</button>
-      <button class="btn btn-secondary" onclick="showManualImport()">🧾 手動匯入</button>
+      <button id="summarize-btn" class="btn btn-primary" onclick="summarizeContent()" title="送交 Gemini 進行筆記整理與摘要">📝 AI 整理</button>
+      <button id="cancel-summarize-btn" class="btn btn-danger" style="display:none;" onclick="cancelSummarize()" title="停止目前的 AI 整理請求">⛔ 中斷</button>
+      <button class="btn btn-secondary" onclick="downloadSubtitle()" title="下載原始或經處理後的字幕檔案 (.vtt/.srt)">📄 字幕檔</button>
+      <button class="btn btn-secondary" onclick="copyLlmInput()" title="複製提示詞與內容，手動提供給其他 AI 處理">📋 複製指令</button>
+      <button class="btn btn-secondary" onclick="downloadAudio()" title="下載轉錄用的音訊檔">🎵 音檔</button>
+      <button class="btn btn-secondary" onclick="downloadVideo()" title="下載原始影片檔">🎬 影片</button>
+      <button class="btn btn-secondary" onclick="showManualImport()" title="手動貼入外部 AI 的整理結果">🧾 手動匯入</button>
     </div>
   </div>
 </div>
@@ -3125,12 +3197,12 @@ HTML_TEMPLATE = r'''
     <div id="summary-video-info" class="video-info" style="display:none;"></div>
     <div id="summary-modal-content" class="content-display"></div>
     <div class="action-bar">
-      <select id="move-category"></select>
-      <button class="btn btn-secondary" onclick="moveSummary()">📂 移動</button>
-      <button class="btn btn-secondary" onclick="copySummary()">📋 複製</button>
-      <button class="btn btn-secondary" onclick="openVideoLink()">🔗 開啟影片</button>
-      <button class="btn btn-secondary" onclick="downloadSummaryVideo()">🎬 下載影片</button>
-      <button class="btn btn-secondary" onclick="downloadSummarySubtitle()">📄 下載字幕</button>
+      <select id="move-category" title="更改此筆記的分類歸屬"></select>
+      <button class="btn btn-secondary" onclick="moveSummary()" title="套用新的分類設定">📂 移動</button>
+      <button class="btn btn-secondary" onclick="copySummary()" title="複製整篇筆記內容到剪貼簿">📋 複製</button>
+      <button class="btn btn-secondary" onclick="openVideoLink()" title="在分頁開啟原始影片網址">🔗 開啟影片</button>
+      <button class="btn btn-secondary" onclick="downloadSummaryVideo()" title="下載此筆記對應的原始影片">🎬 下載影片</button>
+      <button class="btn btn-secondary" onclick="downloadSummarySubtitle()" title="下載此筆記對應的原始字幕">📄 下載字幕</button>
     </div>
   </div>
 </div>
@@ -3149,16 +3221,25 @@ HTML_TEMPLATE = r'''
   </div>
 </div>
 
-<!-- 新增分組 Modal -->
-<div id="group-modal" class="modal">
-  <div class="modal-content" style="max-width: 360px;">
+<!-- 新手教學 Modal -->
+<div id="tutorial-modal" class="modal">
+  <div class="modal-content" style="max-width: 500px;">
     <div class="modal-header">
-      <h2>📂 新增分組</h2>
-      <button class="modal-close" onclick="closeModal('group-modal')">&times;</button>
+      <h2>👋 歡迎使用字幕工具</h2>
+      <button class="modal-close" onclick="closeModal('tutorial-modal')">&times;</button>
     </div>
-    <div class="input-group">
-      <input type="text" id="new-group-name" placeholder="分組名稱" onkeypress="if(event.key==='Enter')addGroup()">
-      <button class="btn btn-primary" onclick="addGroup()">確定</button>
+    <div style="line-height: 1.6;">
+      <p>這是您第一次開啟工具，讓我們簡單介紹一下流程：</p>
+      <ol>
+        <li><strong>📥 貼上網址</strong>：在「提取字幕」頁面貼上 YouTube 或 Bilibili 連結。</li>
+        <li><strong>🚀 開始提取</strong>：程式會自動下載音軌並進行 STT 轉錄（如果沒字幕）。</li>
+        <li><strong>📝 AI 整理</strong>：在「下載管理」點擊 <strong>👁️ 檢視</strong> 並按下 <strong>📝 AI 整理</strong>，讓 Gemini 產出筆記！</li>
+        <li><strong>⚙️ 設定</strong>：記得先去「設定」填入您的 <strong>Gemini API Key</strong> 喔。</li>
+      </ol>
+      <p style="color: var(--accent-yellow);">💡 提示：長音與複雜內容可能需要幾分鐘整理，請耐心等候。</p>
+    </div>
+    <div class="action-bar">
+      <button class="btn btn-primary" onclick="closeModal('tutorial-modal'); localStorage.setItem('tutorial_seen', 'true');" style="width: 100%;">我知道了！</button>
     </div>
   </div>
 </div>
@@ -3222,6 +3303,11 @@ HTML_TEMPLATE = r'''
 
     const savedTheme = localStorage.getItem('theme');
     if (savedTheme === 'dark') toggleTheme();
+
+    // 檢查是否初次顯示教學
+    if (!localStorage.getItem('tutorial_seen')) {
+      document.getElementById('tutorial-modal').classList.add('active');
+    }
 
     setInterval(loadJobs, 2000);
   });
@@ -3537,8 +3623,8 @@ HTML_TEMPLATE = r'''
         <div class="job-progress"><div class="job-progress-bar" style="width:${job.progress || 0}%"></div></div>
         <span style="color: var(--text-secondary); font-size: 0.85rem;">${job.progress || 0}%</span>
         <div class="job-actions">
-          <button class="btn btn-icon btn-secondary" onclick="cancelJob('${job.id}')" title="取消">⛔</button>
-          <button class="btn btn-icon btn-secondary" onclick="deleteJob('${job.id}')" title="刪除">🗑️</button>
+          <button class="btn btn-icon btn-secondary" onclick="cancelJob('${job.id}')" title="停止提取流程">⛔</button>
+          <button class="btn btn-icon btn-secondary" onclick="deleteJob('${job.id}')" title="刪除任務紀錄">🗑️</button>
         </div>
       </div>
     `).join('');
@@ -3578,14 +3664,16 @@ HTML_TEMPLATE = r'''
           </div>
           <div class="job-actions">
             ${job.status === 'completed' ? `
-              <button class="btn btn-secondary btn-small" onclick="showContent('${job.id}')">👁️ 檢視</button>
-              <button class="btn ${btnClass} btn-small" ${btnDisabled} onclick="summarizeJob('${job.id}', this)">${btnText}</button>
-              <button class="btn btn-secondary btn-small" onclick="copyLlmInputForJob('${job.id}')">📋 指令</button>
-              ${job.audio_path ? `<button class="btn btn-secondary btn-small" onclick="downloadAudioForJob('${job.id}')">🎵</button>` : ''}
-              ${job.video_path ? `<button class="btn btn-secondary btn-small" onclick="downloadVideoForJob('${job.id}')">🎬</button>` : ''}
-              <button class="btn btn-secondary btn-small" onclick="showManualImportForJob('${job.id}')">🧾</button>
+              <button class="btn btn-secondary btn-small" onclick="showContent('${job.id}')" title="查看字幕內容、下載音檔或進行 AI 整理">👁️ 檢視</button>
+              <button class="btn ${btnClass} btn-small" ${btnDisabled} onclick="summarizeJob('${job.id}', this)" title="送交 Gemini 進行筆記整理與摘要">
+                ${btnText}
+              </button>
+              <button class="btn btn-secondary btn-small" onclick="copyLlmInputForJob('${job.id}')" title="複製完整提示詞與內容，手動貼給其他 AI">📋 指令</button>
+              ${job.audio_path ? `<button class="btn btn-secondary btn-small" onclick="downloadAudioForJob('${job.id}')" title="下載處理過的 M4A 音檔">🎵</button>` : ''}
+              ${job.video_path ? `<button class="btn btn-secondary btn-small" onclick="downloadVideoForJob('${job.id}')" title="下載原始影片檔案">🎬</button>` : ''}
+              <button class="btn btn-secondary btn-small" onclick="showManualImportForJob('${job.id}')" title="手動貼上外部 AI 整理的結果">🧾</button>
             ` : ''}
-            <button class="btn btn-icon btn-secondary" onclick="deleteJob('${job.id}')" title="刪除">🗑️</button>
+            <button class="btn btn-icon btn-secondary" onclick="deleteJob('${job.id}')" title="永久刪除此任務與相關檔案">🗑️</button>
           </div>
         </div>
       `;
@@ -3658,7 +3746,21 @@ HTML_TEMPLATE = r'''
 
     if (b) {
       b.disabled = true;
-      b.innerHTML = '⏳ 整理中...';
+      // 動態更新按鈕文字提示
+      const waitMessages = [
+        '⏳ 處理中...',
+        '⏳ 等待 Gemini...',
+        '⏳ 請耐心等候...',
+        '⏳ 整理筆記中...',
+        '⏳ 即將完成...'
+      ];
+      let msgIdx = 0;
+      b.innerHTML = waitMessages[0];
+      const waitInterval = setInterval(() => {
+        msgIdx = (msgIdx + 1) % waitMessages.length;
+        b.innerHTML = waitMessages[msgIdx];
+      }, 10000);
+      b.dataset.waitInterval = waitInterval;
     }
 
     try {
@@ -3680,6 +3782,7 @@ HTML_TEMPLATE = r'''
       alert('整理失敗');
     } finally {
       if (b) {
+        clearInterval(b.dataset.waitInterval);
         b.disabled = false;
         b.innerHTML = originalText;
       }
@@ -4019,11 +4122,31 @@ HTML_TEMPLATE = r'''
 
     const btn = document.getElementById('summarize-btn');
     const cancelBtn = document.getElementById('cancel-summarize-btn');
+    const statusArea = document.getElementById('summarize-status-area');
+    const statusText = document.getElementById('summarize-status-text');
     const originalText = btn.innerHTML;
 
     currentSummarizeTaskId = 'task_' + Date.now();
     btn.disabled = true;
-    btn.innerHTML = '⏳ 整理中...';
+    statusArea.style.display = 'block';
+    
+    // 動態更新按鈕與提示區域文字
+    const waitMessages = [
+      '🚀 Gemini 正在思考中...',
+      '⏳ 正在校對逐字稿並整理筆記...',
+      '📚 內容較長，請耐心等候幾分鐘...',
+      '🎨 正在美化排版與產出結果...',
+      '🏁 快好了，請勿關閉視窗...'
+    ];
+    let msgIdx = 0;
+    btn.innerHTML = '⏳ 處理中...';
+    statusText.innerHTML = waitMessages[0];
+
+    const waitInterval = setInterval(() => {
+      msgIdx = (msgIdx + 1) % waitMessages.length;
+      statusText.innerHTML = waitMessages[msgIdx];
+    }, 10000);
+
     cancelBtn.style.display = 'inline-flex';
 
     try {
@@ -4045,8 +4168,10 @@ HTML_TEMPLATE = r'''
     } catch(e) {
       alert('整理失敗');
     } finally {
+      clearInterval(waitInterval);
       btn.disabled = false;
       btn.innerHTML = originalText;
+      statusArea.style.display = 'none';
       cancelBtn.style.display = 'none';
       currentSummarizeTaskId = null;
       await loadJobs();
