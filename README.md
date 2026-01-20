@@ -27,7 +27,7 @@
 * **方法一：使用 winget（推薦）**
 
   ```powershell
-  winget install Python.Python.3.12
+  winget install Python.Python.3.12 --override "PrependPath=1"
   ```
 
 * **方法二：官網下載**
