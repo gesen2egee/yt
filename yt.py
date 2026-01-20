@@ -113,6 +113,8 @@ DEFAULT_CONFIG = {
     "silence_min_duration": 1.0,
     "long_video_threshold_minutes": 30,
     "download_video": False,
+    "audio_segment_minutes": 10,  # 音訊分段時長（分鐘），0 表示不分段
+    "enable_query_repeat": False,  # 啟用提詞重複（提升準確度但會加倍 token）
     "category_groups": {},  # { "group_name": ["cat1", "cat2"], ... }
     "collapsed_groups": [],  # 收縮的分組
 }
@@ -665,6 +667,60 @@ def get_audio_duration_seconds(audio_path: Path) -> float:
     except Exception:
         pass
     return 0.0
+
+def split_audio_by_duration(audio_path: Path, segment_minutes: int, output_dir: Path) -> List[Path]:
+    """
+    將音訊按時長切割成多段
+    
+    Args:
+        audio_path: 原始音訊檔案路徑
+        segment_minutes: 每段的分鐘數
+        output_dir: 輸出目錄
+    
+    Returns:
+        分段檔案路徑列表，如果不需要切割則返回包含原始檔案的單元素列表
+    """
+    if segment_minutes <= 0:
+        return [audio_path]
+    
+    total_seconds = get_audio_duration_seconds(audio_path)
+    segment_seconds = segment_minutes * 60
+    
+    # 如果音訊時長小於分段時長，不需要切割
+    if total_seconds <= segment_seconds:
+        return [audio_path]
+    
+    output_dir.mkdir(parents=True, exist_ok=True)
+    segments = []
+    segment_count = int((total_seconds // segment_seconds) + (1 if total_seconds % segment_seconds > 0 else 0))
+    
+    base_name = audio_path.stem
+    ext = audio_path.suffix
+    
+    for i in range(segment_count):
+        start_time = i * segment_seconds
+        segment_path = output_dir / f"{base_name}_seg{i+1:03d}{ext}"
+        
+        cmd = [
+            "ffmpeg", "-y", "-hide_banner", "-nostats",
+            "-i", str(audio_path),
+            "-ss", str(start_time),
+            "-t", str(segment_seconds),
+            "-c", "copy",
+            str(segment_path)
+        ]
+        
+        try:
+            subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300)
+            if segment_path.exists():
+                segments.append(segment_path)
+        except Exception as e:
+            print(f"切割音訊失敗 (segment {i+1}): {e}")
+            # 如果切割失敗，返回原始檔案
+            return [audio_path]
+    
+    return segments if segments else [audio_path]
+
 
 # =============================================================================
 # 音訊前處理
@@ -1277,15 +1333,38 @@ class GeminiProcessor:
         print(f"✅ 檔案上傳成功: {uploaded_file.name}")
         return uploaded_file
 
-    def process_audio(self, title: str, audio_path: Path, model: str = "google/gemini-3-flash-preview:thinking") -> Tuple[str, str, str, int, int]:
+    def process_audio(self, title: str, audio_path: Path, model: str = "google/gemini-3-flash-preview:thinking",
+                     segment_minutes: int = 0, enable_query_repeat: bool = False) -> Tuple[str, str, str, int, int]:
         """
         處理音檔，返回：(字幕, 整理內容, 翻譯標題, input_tokens, output_tokens)
+        
+        Args:
+            title: 影片標題
+            audio_path: 音訊檔案路徑
+            model: 使用的模型
+            segment_minutes: 分段時長（分鐘），0 表示不分段
+            enable_query_repeat: 是否啟用提詞重複
         """
         from google.genai import types
 
-        uploaded_file = self.upload_file(audio_path)
-
-        prompt = f"""你是一位逐字稿校對員＋內容歸檔整理員。最高優先是「完整保留資訊」，整理內容不是摘要，而是可回放的完整筆記；只移除明顯重複與純口語填充。請嚴格依照指定區塊格式輸出。
+        # 檢查是否需要分段
+        segments_paths = split_audio_by_duration(audio_path, segment_minutes, AUDIO_CACHE_DIR / "segments")
+        
+        total_input_tokens = 0
+        total_output_tokens = 0
+        all_subtitles = []
+        all_contents = []
+        translated_title = title
+        
+        for idx, segment_path in enumerate(segments_paths):
+            print(f"📝 處理音訊段 {idx + 1}/{len(segments_paths)}")
+            
+            uploaded_file = self.upload_file(segment_path)
+            
+            # 基礎提示詞
+            if idx == 0:
+                # 第一段
+                prompt = f"""你是一位逐字稿校對員＋內容歸檔整理員。最高優先是「完整保留資訊」，整理內容不是摘要，而是可回放的完整筆記；只移除明顯重複與純口語填充。請嚴格依照指定區塊格式輸出。
         
 ## 任務一：產生字幕
 請將音訊內容轉成逐字稿，格式為：
@@ -1331,72 +1410,128 @@ class GeminiProcessor:
 （在此輸出翻譯後的標題）
 ===標題結束===
 """
+            else:
+                # 後續段落，包含前一段的內容作為上下文
+                previous_content = all_contents[-1] if all_contents else ""
+                prompt = f"""你是一位逐字稿校對員＋內容歸檔整理員。這是音訊的第 {idx + 1} 段，請繼續處理。
 
-        # 轉換模型名稱
-        gemini_model = model.replace("google/", "").replace(":thinking", "")
-        if not gemini_model.startswith("gemini-"):
-            gemini_model = "google/gemini-3-flash-preview"
+##上下文（前一段的整理內容）：
+{previous_content[:2000]}
+...
 
-        # 生成配置
-        config = types.GenerateContentConfig(
-            temperature=1.0,
-        )
+## 任務一：產生字幕
+請將音訊內容轉成逐字稿，格式為：
+[MM:SS] 一行內容
+
+## 任務二：整理內容
+繼續整理音訊內容，與前文銜接：
+1. 保留所有重要資訊
+2. 移除重複、口語贅詞、修正錯字
+3. 適當分段，加上小標題（使用 ### 標記）
+4. 保留時間戳 [MM:SS]
+
+請依照以下格式輸出：
+
+===字幕開始===
+（在此輸出字幕）
+===字幕結束===
+
+===整理開始===
+（在此輸出整理內容）
+===整理結束===
+"""
         
-        # 如果是 thinking 模式
-        if ":thinking" in model:
+            # 轉換模型名稱
+            gemini_model = model.replace("google/", "").replace(":thinking", "")
+            if not gemini_model.startswith("gemini-"):
+                gemini_model = "google/gemini-3-flash-preview"
+    
+            # 生成配置
             config = types.GenerateContentConfig(
                 temperature=1.0,
-                thinking_config=types.ThinkingConfig(thinking_level="high"),
             )
-
-        # 呼叫 API
-        response = self.client.models.generate_content(
-            model=gemini_model,
-            contents=[
-                types.Content(
-                    role="user",
-                    parts=[
-                        types.Part.from_uri(file_uri=uploaded_file.uri, mime_type=uploaded_file.mime_type),
-                        types.Part.from_text(text=prompt),
-                    ]
+            
+            # 如果是 thinking 模式
+            if ":thinking" in model:
+                config= types.GenerateContentConfig(
+                    temperature=1.0,
+                    thinking_config=types.ThinkingConfig(thinking_level="high"),
                 )
-            ],
-            config=config
-        )
-
-        result_text = ""
-        if response.candidates:
-            for part in response.candidates[0].content.parts:
-                if hasattr(part, 'text') and part.text:
-                    result_text += part.text
-
-        input_tokens = response.usage_metadata.prompt_token_count if response.usage_metadata else 0
-        output_tokens = response.usage_metadata.candidates_token_count if response.usage_metadata else 0
-
-        # 刪除上傳的檔案
-        try:
-            self.client.files.delete(name=uploaded_file.name)
-        except:
-            pass
-
-        # 解析結果
-        subtitle = ""
-        content = ""
-        translated_title = title
-
-        subtitle_match = re.search(r'===字幕開始===\s*(.*?)\s*===字幕結束===', result_text, re.DOTALL)
-        if subtitle_match:
-            subtitle = subtitle_match.group(1).strip()
-
-        content_match = re.search(r'===整理開始===\s*(.*?)\s*===整理結束===', result_text, re.DOTALL)
-        if content_match:
-            content = content_match.group(1).strip()
-
-        title_match = re.search(r'===標題===\s*(.*?)\s*===標題結束===', result_text, re.DOTALL)
-        if title_match:
-            translated_title = title_match.group(1).strip()
-
-        return subtitle, content, translated_title, input_tokens, output_tokens
+            
+            # 構建 content parts
+            parts = [
+                types.Part.from_uri(file_uri=uploaded_file.uri, mime_type=uploaded_file.mime_type),
+                types.Part.from_text(text=prompt),
+            ]
+            
+            # 如果啟用提詞重複，將整個 parts 重複一次
+            if enable_query_repeat:
+                parts = parts + parts
+    
+            # 呼叫 API
+            response = self.client.models.generate_content(
+                model=gemini_model,
+                contents=[
+                    types.Content(
+                        role="user",
+                        parts=parts
+                    )
+                ],
+                config=config
+            )
+    
+            result_text = ""
+            if response.candidates:
+                for part in response.candidates[0].content.parts:
+                    if hasattr(part, 'text') and part.text:
+                        result_text += part.text
+    
+            total_input_tokens += response.usage_metadata.prompt_token_count if response.usage_metadata else 0
+            total_output_tokens += response.usage_metadata.candidates_token_count if response.usage_metadata else 0
+    
+            # 刪除上傳的檔案
+            try:
+                self.client.files.delete(name=uploaded_file.name)
+            except:
+                pass
+    
+            # 解析結果
+            subtitle_match = re.search(r'===字幕開始===\s*(.*?)\s*===字幕結束===', result_text, re.DOTALL)
+            if subtitle_match:
+                all_subtitles.append(subtitle_match.group(1).strip())
+    
+            content_match = re.search(r'===整理開始===\s*(.*?)\s*===整理結束===', result_text, re.DOTALL)
+            if content_match:
+                all_contents.append(content_match.group(1).strip())
+    
+            # 只從第一段提取標題
+            if idx == 0:
+                title_match = re.search(r'===標題===\s*(.*?)\s*===標題結束===', result_text, re.DOTALL)
+                if title_match:
+                    translated_title = title_match.group(1).strip()
+        
+        # 清理分段檔案
+        if len(segments_paths) > 1:
+            for seg_path in segments_paths:
+                try:
+                    if seg_path.exists() and seg_path != audio_path:
+                        seg_path.unlink()
+                except:
+                    pass
+            # 清理分段目錄
+            try:
+                segments_dir = AUDIO_CACHE_DIR / "segments"
+                if segments_dir.exists():
+                    import shutil
+                    shutil.rmtree(segments_dir, ignore_errors=True)
+            except:
+                pass
+        
+        # 合併所有結果
+        final_subtitle = "\n\n".join(all_subtitles)
+        final_content = "\n\n".join(all_contents)
+        
+        return final_subtitle, final_content, translated_title, total_input_tokens, total_output_tokens
 
     def summarize_text(self, title: str, content: str, model: str = "google/gemini-3-flash-preview:thinking") -> Tuple[str, str, int, int]:
         """整理文字內容，返回：(翻譯標題, 整理內容, input_tokens, output_tokens)"""
@@ -2082,8 +2217,14 @@ def create_summary():
                 AudioPreprocessor.cleanup_cache(cache_prefix)
                 return jsonify({'error': '已取消', 'cancelled': True}), 200
 
+            # 獲取配置參數
+            segment_minutes = int(config.get("audio_segment_minutes", 0) or 0)
+            enable_query_repeat = bool(config.get("enable_query_repeat", False))
+            
             subtitle, content, generated_title, input_tokens, output_tokens = gemini.process_audio(
-                final_title, processed_audio, model
+                final_title, processed_audio, model,
+                segment_minutes=segment_minutes,
+                enable_query_repeat=enable_query_repeat
             )
 
             # 補償時間戳
@@ -2903,6 +3044,17 @@ HTML_TEMPLATE = r'''
           <input id="silence-min-duration" type="number" step="0.1" min="0.1">
         </div>
       </div>
+      <div class="form-row">
+        <div class="form-group">
+          <label>音訊分段時長（分鐘）</label>
+          <input id="audio-segment-minutes" type="number" step="1" min="0" max="60" placeholder="0 表示不分段">
+          <small style="color: var(--text-secondary); font-size: 0.85rem;">超過此時長的音訊將自動切段處理（0 = 不分段）</small>
+        </div>
+      </div>
+      <div class="checkbox-group">
+        <input type="checkbox" id="enable-query-repeat">
+        <label for="enable-query-repeat">啟用提詞重複（提升準確度但會加倍 token 使用量）</label>
+      </div>
     </div>
 
     <div class="card">
@@ -3113,6 +3265,8 @@ HTML_TEMPLATE = r'''
       document.getElementById('llm-audio-speed').value = config.llm_audio_speed ?? 1.5;
       document.getElementById('silence-noise-db').value = config.silence_noise_db ?? -40;
       document.getElementById('silence-min-duration').value = config.silence_min_duration ?? 1.0;
+      document.getElementById('audio-segment-minutes').value = config.audio_segment_minutes ?? 0;
+      document.getElementById('enable-query-repeat').checked = config.enable_query_repeat || false;
       document.getElementById('long-video-threshold').value = config.long_video_threshold_minutes ?? 30;
       document.getElementById('download-video-check').checked = config.download_video || false;
 
@@ -3149,6 +3303,8 @@ HTML_TEMPLATE = r'''
         llm_audio_speed: parseFloat(document.getElementById('llm-audio-speed').value) || 1.5,
         silence_noise_db: parseFloat(document.getElementById('silence-noise-db').value) || -40,
         silence_min_duration: parseFloat(document.getElementById('silence-min-duration').value) || 1.0,
+        audio_segment_minutes: parseInt(document.getElementById('audio-segment-minutes').value) || 0,
+        enable_query_repeat: document.getElementById('enable-query-repeat').checked,
         long_video_threshold_minutes: parseFloat(document.getElementById('long-video-threshold').value) || 30,
         download_video: document.getElementById('download-video-check').checked,
       };
