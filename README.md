@@ -20,7 +20,7 @@
 
 ## 🚀 快速開始
 
-### 1. 環境準備
+### 1. 環境準備 (Windows)
 
 #### 安裝 Python 3.10+
 
@@ -35,11 +35,7 @@
   * 下載 Windows 安裝檔
   * 安裝時**務必勾選「Add Python to PATH」**
 
-驗證安裝：
-
-```powershell
-python --version
-```
+驗證安裝：開啟終端機輸入 `python --version`
 
 #### 安裝 Git
 
@@ -53,11 +49,7 @@ python --version
   * 前往 [Git 官網](https://git-scm.com/download/win)
   * 下載並安裝（全部使用預設設定即可）
 
-驗證安裝：
-
-```powershell
-git --version
-```
+驗證安裝：開啟終端機輸入 `git --version`
 
 #### 安裝 ffmpeg（音訊處理必需）
 
@@ -73,34 +65,91 @@ git --version
     3. 將 `C:\ffmpeg\bin` 加入系統環境變數 PATH
     4. 重新啟動終端機
 
-驗證安裝：
-
-```powershell
-ffmpeg -version
-```
-
-### 2. 下載專案並啟動 (Windows 推薦)
-
-下載此專案後，Windows 使用者可以透過以下腳本進行操作：
-
-* **初次啟動**：點擊 `install.bat`，程式會自動建立虛擬環境 (`venv`) 並安裝所有套件。
-* **日常使用**：點擊 `run.bat` 即可啟動程式。
+驗證安裝：開啟終端機輸入 `ffmpeg -version`
 
 ---
 
-### 3. 手動安裝與執行 (進階)
+### 💡 新手小教室：如何操作「小黑窗」與 Git
 
-如果你想使用手動指令：
+#### 1. 如何打開終端機 (小黑窗)
+很多操作需要與電腦對話，我們透過「終端機」來完成：
+1. 在資料夾的空白處，按住鍵盤 **Shift** 鍵不放。
+2. 同時點擊滑鼠 **右鍵**。
+3. 選擇 **「在此處開啟 PowerShell 視窗」** 或 **「在此處開啟命令提示字元」**。
+4. 出現的黑底或藍底視窗，就是你的「小黑窗」。
 
+#### 2. 如何下載程式碼 (Git Clone)
+這是將程式從網路上下載到你電腦的指令：
+1. 依照上述方法打開小黑窗。
+2. 複製以下指令，在小黑窗中貼上 (滑鼠右鍵通常就是貼上)，然後按 Enter：
+   ```powershell
+   git clone https://github.com/gesen2egee/yt.git
+   ```
+3. 下載完成後，輸入以下指令進入資料夾：
+   ```powershell
+   cd yt
+   ```
+
+---
+
+### 2. 啟動程式 (Windows)
+
+#### ✅ 自動安裝 (推薦)
+如果你已經下載好專案 (透過 Git 或 ZIP)，請直接使用資料夾中的懶人包：
+
+* **初次使用**：雙擊 **`install.bat`**。
+  * 程式會自動設定環境並安裝所有套件，請耐心等待視窗顯示完成。
+* **日常使用**：雙擊 **`run.bat`** 即可啟動。
+
+#### 💻 手動安裝 (進階)
+如果你想自己動手：
 ```powershell
-git clone <你的專案網址>
-cd yt
+# 1. 建立虛擬環境
+python -m venv venv
+
+# 2. 啟動虛擬環境
+.\venv\Scripts\activate
+
+# 3. 安裝套件
+pip install -r requirements.txt
+
+# 4. 執行
 python yt.py
 ```
 
-第一次執行時，程式會自動幫你安裝所有需要的 Python 套件 (如 `flask`, `yt-dlp`, `google-genai` 等)，請耐心等待。
+---
 
-### 3. 開始使用
+### 3. macOS 使用者安裝指南 🍎
+
+Mac 使用者請打開 **Terminal (終端機)** 進行操作：
+
+#### 1. 安裝基礎軟體
+推薦使用 Homebrew 安裝：
+```bash
+brew install python ffmpeg git
+```
+
+#### 2. 下載專案與安裝
+```bash
+git clone https://github.com/gesen2egee/yt.git
+cd yt
+
+# 建立虛擬環境
+python3 -m venv venv
+
+# 啟動虛擬環境
+source venv/bin/activate
+
+# 安裝套件
+pip install -r requirements.txt
+```
+
+#### 3. 啟動程式
+```bash
+python3 yt.py
+```
+
+### 4. 開始使用
 
 程式啟動後，會自動開啟網頁瀏覽器 (通常是 `http://127.0.0.1:5000`)。
 你可以在網頁介面上：
