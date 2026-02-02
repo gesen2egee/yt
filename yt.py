@@ -1064,9 +1064,11 @@ class YTDLPProcessor:
             subs = info.get("subtitles") or {}
             auto = info.get("automatic_captions") or {}
             if not subs and not auto:
+                print("ℹ️ 此影片無可用字幕")
                 return None
             langs = self.get_sub_lang_candidates(info, max_extra=8)
             if not langs:
+                print("ℹ️ 無符合條件的字幕語言")
                 return None
         else:
             langs = self.LANG_PRIORITY
@@ -1097,14 +1099,24 @@ class YTDLPProcessor:
         ]
 
         try:
-            subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
-        except:
+            print(f"📝 嘗試下載字幕（語言優先順序: {', '.join(langs[:5])}...）")
+            result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
+            if result.returncode != 0:
+                print(f"⚠️ yt-dlp 字幕下載返回碼: {result.returncode}")
+        except subprocess.TimeoutExpired:
+            print("❌ 字幕下載超時（120秒）")
+            return None
+        except Exception as e:
+            print(f"❌ 字幕下載失敗: {type(e).__name__}: {e}")
             return None
 
         # 找所有產出的字幕
         files = list(output_dir.glob(f"{output_name}*.vtt")) + list(output_dir.glob(f"{output_name}*.srt"))
         if not files:
+            print("ℹ️ 未找到下載的字幕檔案")
             return None
+
+        print(f"✅ 找到 {len(files)} 個字幕檔案")
 
         # 用優先順序挑：檔名通常會包含 .<lang>.vtt / .<lang>.srt
         # 這邊用「包含 .{lang}. 」做簡單匹配（比硬切字串穩一點）
@@ -1112,10 +1124,13 @@ class YTDLPProcessor:
             for f in files:
                 name = f.name
                 if f".{lang}." in name:
+                    print(f"✅ 選擇字幕: {f.name} (語言: {lang})")
                     return (f, lang)
 
         # 如果檔名沒帶 lang（少數情況），就隨便回傳一個
+        print(f"✅ 選擇字幕: {files[0].name} (語言: unknown)")
         return (files[0], "unknown")
+
 
     def download_audio(self, url: str, output_dir: Path, title: str, video_id: str, 
                        audio_format: str = "m4a") -> Optional[Path]:
@@ -1123,7 +1138,9 @@ class YTDLPProcessor:
         output_name = f"{safe_title}_{video_id}"
         output_path = output_dir / f"{output_name}.{audio_format}"
         
+        # 如果檔案已存在，直接返回
         if output_path.exists():
+            print(f"✅ 音檔已存在: {output_path.name}")
             return output_path
 
         format_map = {
@@ -1143,20 +1160,61 @@ class YTDLPProcessor:
             "--postprocessor-args", f"ffmpeg:{pp_args}",
             "-o", str(output_dir / f"{output_name}.%(ext)s"), url
         ]
+        
         try:
-            subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=600)
+            print(f"📥 開始下載音軌: {title[:50]}...")
+            result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=600)
+            
+            # 記錄輸出（用於除錯）
+            if result.returncode != 0:
+                print(f"⚠️ yt-dlp 返回碼: {result.returncode}")
+                if result.stderr:
+                    # 只顯示錯誤訊息的前500字元
+                    stderr_preview = result.stderr[:500]
+                    print(f"錯誤訊息: {stderr_preview}")
+            
+            # 檢查目標檔案是否存在
             if output_path.exists():
+                print(f"✅ 下載成功: {output_path.name} ({output_path.stat().st_size / 1024 / 1024:.2f} MB)")
                 return output_path
-            # 嘗試找其他格式
+            
+            # 嘗試找其他可能的音訊檔案（包括可能的格式變異）
+            print(f"🔍 搜尋下載的音訊檔案： {output_name}.*")
+            found_files = []
             for f in output_dir.glob(f"{output_name}.*"):
-                if f.suffix.lower() in [".m4a", ".mp3", ".wav", ".mp4", ".webm"]:
-                    try:
-                        f.rename(output_path)
+                if f.suffix.lower() in [".m4a", ".mp3", ".wav", ".mp4", ".webm", ".opus", ".aac"]:
+                    found_files.append(f)
+                    print(f"   找到: {f.name} ({f.stat().st_size / 1024 / 1024:.2f} MB)")
+            
+            if found_files:
+                # 優先選擇目標格式，否則選第一個
+                target_file = found_files[0]
+                for f in found_files:
+                    if f.suffix.lower() == f".{ext}":
+                        target_file = f
+                        break
+                
+                # 嘗試重命名為目標格式
+                try:
+                    if target_file != output_path:
+                        target_file.rename(output_path)
+                        print(f"✅ 重命名為: {output_path.name}")
                         return output_path
-                    except:
-                        return f
+                    else:
+                        return target_file
+                except Exception as rename_error:
+                    print(f"⚠️ 無法重命名檔案: {rename_error}，使用原檔案")
+                    return target_file
+            else:
+                print(f"❌ 在 {output_dir} 中找不到任何符合的音訊檔案")
+                
+        except subprocess.TimeoutExpired:
+            print(f"❌ 下載超時（600秒）")
         except Exception as e:
-            print(f"下載音軌失敗: {e}")
+            print(f"❌ 下載音軌失敗: {type(e).__name__}: {e}")
+            import traceback
+            traceback.print_exc()
+        
         return None
 
     def download_video(self, url: str, output_dir: Path, title: str, video_id: str) -> Optional[Path]:
