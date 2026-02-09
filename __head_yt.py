@@ -35,7 +35,6 @@ import webbrowser
 import argparse
 import time
 import shutil
-import concurrent.futures
 from datetime import datetime
 from pathlib import Path
 from dataclasses import dataclass, field, asdict
@@ -1681,9 +1680,6 @@ class GeminiProcessor:
 summarizing_jobs: Set[str] = set()
 # 正在處理的整理任務
 active_summarize_tasks: Dict[str, threading.Event] = {}
-batch_tasks_lock = threading.Lock()
-batch_tasks: Dict[str, Dict[str, Any]] = {}
-APP_PORT = 5000
 
 class JobProcessor:
     def __init__(self):
@@ -1890,9 +1886,8 @@ class JobProcessor:
 job_processor = JobProcessor()
 
 job_queue: "queue.Queue[str]" = queue.Queue()
-worker_threads: List[threading.Thread] = []
+worker_thread: Optional[threading.Thread] = None
 worker_stop = threading.Event()
-MAX_EXTRACTION_WORKERS = 3
 
 def worker_loop():
     while not worker_stop.is_set():
@@ -1905,146 +1900,12 @@ def worker_loop():
         finally:
             job_queue.task_done()
 
-def start_worker_pool(worker_count: int = MAX_EXTRACTION_WORKERS):
-    target = max(1, min(MAX_EXTRACTION_WORKERS, int(worker_count or 1)))
-    alive = [t for t in worker_threads if t.is_alive()]
-    worker_threads[:] = alive
-    while len(worker_threads) < target:
-        t = threading.Thread(target=worker_loop, daemon=True)
-        t.start()
-        worker_threads.append(t)
-
-def expand_urls_for_jobs(urls: List[str], ytdlp: Optional[YTDLPProcessor] = None) -> List[str]:
-    processor = ytdlp or YTDLPProcessor()
-    expanded: List[str] = []
-    for raw in urls:
-        url = (raw or "").strip()
-        if not url:
-            continue
-        if "list=" in url or "/playlist" in url:
-            playlist_urls = processor.get_playlist_urls(url)
-            if playlist_urls:
-                expanded.extend(playlist_urls)
-            else:
-                expanded.append(url)
-        else:
-            expanded.append(url)
-    return expanded
-
-def enqueue_job(url: str) -> Job:
-    job = Job(id=str(uuid.uuid4()), url=url, status="queued", stage="等待處理", progress=0)
-    data_manager.add_job(job)
-    job_queue.put(job.id)
-    start_worker_pool()
-    return job
-
-def _batch_counts(items: List[Dict[str, Any]]) -> Dict[str, int]:
-    return {
-        "total": len(items),
-        "pending": sum(1 for i in items if i.get("status") == "pending"),
-        "extracting": sum(1 for i in items if i.get("status") == "extracting"),
-        "summarizing": sum(1 for i in items if i.get("status") == "summarizing"),
-        "completed": sum(1 for i in items if i.get("status") == "completed"),
-        "error": sum(1 for i in items if i.get("status") == "error"),
-    }
-
-def _batch_update_item(batch_id: str, item_id: str, **fields):
-    with batch_tasks_lock:
-        task = batch_tasks.get(batch_id)
-        if not task:
-            return
-        for item in task["items"]:
-            if item["id"] == item_id:
-                item.update(fields)
-                break
-        counts = _batch_counts(task["items"])
-        task["counts"] = counts
-        if task["status"] == "running" and counts["completed"] + counts["error"] >= counts["total"]:
-            task["status"] = "completed"
-            task["finished_at"] = datetime.now().isoformat()
-
-def _batch_snapshot(batch_id: str) -> Optional[Dict[str, Any]]:
-    with batch_tasks_lock:
-        task = batch_tasks.get(batch_id)
-        if not task:
-            return None
-        return {
-            "id": task["id"],
-            "status": task["status"],
-            "created_at": task["created_at"],
-            "finished_at": task.get("finished_at", ""),
-            "concurrency": task["concurrency"],
-            "counts": dict(task.get("counts", {})),
-            "items": [dict(item) for item in task["items"]],
-        }
-
-def _run_batch_item(batch_id: str, item: Dict[str, Any]):
-    item_id = item["id"]
-    category = (item.get("category") or "未分類").strip() or "未分類"
-    try:
-        _batch_update_item(batch_id, item_id, status="extracting", message="")
-        job = enqueue_job(item["url"])
-        _batch_update_item(batch_id, item_id, job_id=job.id)
-
-        while True:
-            latest = data_manager.get_job(job.id)
-            if not latest:
-                _batch_update_item(batch_id, item_id, status="error", message="找不到工作")
-                return
-            if latest.status in ("completed", "error", "cancelled"):
-                break
-            time.sleep(1.0)
-
-        if latest.status != "completed":
-            _batch_update_item(batch_id, item_id, status="error", message=latest.error_message or latest.status or "提取失敗")
-            return
-
-        _batch_update_item(batch_id, item_id, status="summarizing", message="")
-        task_id = f"batch_{batch_id}_{item_id}_{int(time.time() * 1000)}"
-        res = requests.post(
-            f"http://127.0.0.1:{APP_PORT}/api/summaries",
-            json={"job_id": job.id, "task_id": task_id},
-            timeout=7200
-        )
-        try:
-            payload = res.json()
-        except Exception:
-            payload = {"error": f"摘要回傳格式錯誤 ({res.status_code})"}
-
-        if res.status_code >= 400 or payload.get("error"):
-            _batch_update_item(batch_id, item_id, status="error", message=payload.get("error", f"摘要失敗 ({res.status_code})"))
-            return
-
-        summary_id = payload.get("id", "")
-        if summary_id:
-            data_manager.move_summary(summary_id, category)
-
-        _batch_update_item(batch_id, item_id, status="completed", summary_id=summary_id, message="")
-    except Exception as e:
-        _batch_update_item(batch_id, item_id, status="error", message=str(e))
-
-def _run_batch_task(batch_id: str):
-    with batch_tasks_lock:
-        task = batch_tasks.get(batch_id)
-        if not task:
-            return
-        items = [dict(item) for item in task["items"]]
-        concurrency = int(task.get("concurrency", 3) or 3)
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
-        futures = [executor.submit(_run_batch_item, batch_id, item) for item in items]
-        for future in concurrent.futures.as_completed(futures):
-            try:
-                future.result()
-            except Exception:
-                pass
-
-    with batch_tasks_lock:
-        task = batch_tasks.get(batch_id)
-        if task and task["status"] != "completed":
-            task["counts"] = _batch_counts(task["items"])
-            task["status"] = "completed"
-            task["finished_at"] = datetime.now().isoformat()
+def start_worker_once():
+    global worker_thread
+    if worker_thread and worker_thread.is_alive():
+        return
+    worker_thread = threading.Thread(target=worker_loop, daemon=True)
+    worker_thread.start()
 
 # =============================================================================
 # Flask
@@ -2063,66 +1924,6 @@ def add_no_cache_headers(resp):
 @app.route('/')
 def index():
     return render_template_string(HTML_TEMPLATE)
-
-@app.route('/batch')
-def batch_page():
-    return render_template_string(BATCH_TEMPLATE)
-
-@app.route('/api/batch/start', methods=['POST'])
-def start_batch():
-    data = request.json or {}
-    raw_items = data.get("items", [])
-    try:
-        concurrency = int(data.get("concurrency", 3))
-    except Exception:
-        concurrency = 3
-    concurrency = max(1, min(3, concurrency))
-
-    processor = YTDLPProcessor()
-    parsed_items: List[Dict[str, Any]] = []
-    for raw_item in raw_items:
-        category = (raw_item.get("category") or "未分類").strip() or "未分類"
-        urls = raw_item.get("urls", [])
-        if isinstance(urls, str):
-            urls = urls.splitlines()
-        expanded = expand_urls_for_jobs(urls, processor)
-        for url in expanded:
-            parsed_items.append({
-                "id": str(uuid.uuid4()),
-                "category": category,
-                "url": url,
-                "status": "pending",
-                "message": "",
-                "job_id": "",
-                "summary_id": "",
-            })
-
-    if not parsed_items:
-        return jsonify({"error": "請至少填入一個有效網址"}), 400
-
-    batch_id = str(uuid.uuid4())
-    task = {
-        "id": batch_id,
-        "status": "running",
-        "created_at": datetime.now().isoformat(),
-        "finished_at": "",
-        "concurrency": concurrency,
-        "items": parsed_items,
-    }
-    task["counts"] = _batch_counts(task["items"])
-
-    with batch_tasks_lock:
-        batch_tasks[batch_id] = task
-
-    threading.Thread(target=_run_batch_task, args=(batch_id,), daemon=True).start()
-    return jsonify({"batch_id": batch_id, "counts": task["counts"], "concurrency": concurrency})
-
-@app.route('/api/batch/<batch_id>', methods=['GET'])
-def get_batch(batch_id):
-    snapshot = _batch_snapshot(batch_id)
-    if not snapshot:
-        return jsonify({"error": "找不到批次任務"}), 404
-    return jsonify(snapshot)
 
 @app.route('/api/config', methods=['GET'])
 def get_config():
@@ -2231,12 +2032,35 @@ def check_job_duration():
 def create_jobs():
     data = request.json or {}
     urls = data.get('urls', [])
-    all_expanded_urls = expand_urls_for_jobs(urls)
+
+    ytdlp = YTDLPProcessor()
+    all_expanded_urls = []
+    
+    for url in urls:
+        url = (url or "").strip()
+        if not url:
+            continue
+            
+        # 偵測是否為合輯 (Playlist)
+        if "list=" in url or "/playlist" in url:
+            print(f"🔗 偵測到合輯網址，正在展開: {url}")
+            playlist_urls = ytdlp.get_playlist_urls(url)
+            if playlist_urls:
+                all_expanded_urls.extend(playlist_urls)
+            else:
+                # 展開失敗則當成一般網址處理
+                all_expanded_urls.append(url)
+        else:
+            all_expanded_urls.append(url)
 
     created_jobs = []
     for url in all_expanded_urls:
-        job = enqueue_job(url)
+        job = Job(id=str(uuid.uuid4()), url=url, status="queued", stage="等待中", progress=0)
+        data_manager.add_job(job)
         created_jobs.append(asdict(job))
+        job_queue.put(job.id)
+
+    start_worker_once()
     return jsonify(created_jobs)
 
 @app.route('/api/jobs/<job_id>', methods=['GET'])
@@ -3149,7 +2973,6 @@ HTML_TEMPLATE = r'''
       </div>
       <div class="form-row">
         <button class="btn btn-primary" onclick="startExtraction()">🚀 開始提取</button>
-        <button class="btn btn-secondary" onclick="openBatchWindow()">📦 批次輸入視窗</button>
       </div>
       <div style="margin-top:10px; color: var(--text-secondary); font-size: 0.85rem;">
         ※ 若影片有字幕會直接抓字幕；沒字幕則根據設定處理<br>
@@ -3730,10 +3553,6 @@ HTML_TEMPLATE = r'''
       const stats = await res.json();
       renderStats(stats);
     } catch (e) { console.error(e); }
-  }
-
-  function openBatchWindow() {
-    window.open('/batch', '_blank', 'width=1200,height=900');
   }
 
   async function startExtraction() {
@@ -4663,191 +4482,6 @@ HTML_TEMPLATE = r'''
 </html>
 '''
 
-BATCH_TEMPLATE = r'''
-<!DOCTYPE html>
-<html lang="zh-TW">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>批次提取與整理</title>
-  <style>
-    :root {
-      --bg: #f5f7fb;
-      --card: #ffffff;
-      --text: #1f2937;
-      --muted: #6b7280;
-      --line: #e5e7eb;
-      --primary: #2563eb;
-    }
-    * { box-sizing: border-box; }
-    body { margin: 0; background: var(--bg); color: var(--text); font-family: "Segoe UI", sans-serif; }
-    .wrap { max-width: 1200px; margin: 0 auto; padding: 20px; }
-    .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 16px; margin-bottom: 16px; }
-    .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
-    .btn { border: 1px solid var(--line); border-radius: 8px; background: #fff; padding: 8px 12px; cursor: pointer; }
-    .btn-primary { background: var(--primary); border-color: var(--primary); color: #fff; }
-    .item { border: 1px solid var(--line); border-radius: 10px; padding: 12px; margin-top: 10px; }
-    .item textarea { width: 100%; min-height: 120px; resize: vertical; margin-top: 8px; border: 1px solid var(--line); border-radius: 8px; padding: 10px; font-family: Consolas, monospace; }
-    .item input[type=text] { width: 280px; max-width: 100%; border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
-    .hint { color: var(--muted); font-size: 13px; margin-top: 6px; }
-    .num { width: 72px; border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
-    .grid { width: 100%; border-collapse: collapse; font-size: 14px; }
-    .grid th, .grid td { border-bottom: 1px solid var(--line); padding: 8px 6px; text-align: left; vertical-align: top; }
-    .tag { padding: 2px 8px; border-radius: 999px; font-size: 12px; display: inline-block; }
-    .s-pending { background: #eef2ff; color: #4338ca; }
-    .s-extracting { background: #e0f2fe; color: #0369a1; }
-    .s-summarizing { background: #fef3c7; color: #92400e; }
-    .s-completed { background: #dcfce7; color: #166534; }
-    .s-error { background: #fee2e2; color: #991b1b; }
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <div class="card">
-      <h2 style="margin:0 0 8px 0;">批次提取 + AI 整理</h2>
-      <div class="row" style="margin-bottom:10px;">
-        <label>同時執行數</label>
-        <input id="concurrency" class="num" type="number" min="1" max="3" value="3" />
-        <span class="hint">預設 3，最大 3</span>
-      </div>
-      <div class="row">
-        <button class="btn" onclick="addItem()">+ 新增項目</button>
-        <button class="btn btn-primary" onclick="startBatch()">開始批次</button>
-      </div>
-      <div class="hint">每個項目可填不同分類名。分類會自動加入現有分類，若不存在則自動建立。</div>
-      <div id="items"></div>
-    </div>
-
-    <div class="card">
-      <div id="summary"></div>
-      <table class="grid">
-        <thead>
-          <tr>
-            <th style="width:140px;">狀態</th>
-            <th style="width:180px;">分類</th>
-            <th>網址</th>
-            <th style="width:220px;">訊息</th>
-          </tr>
-        </thead>
-        <tbody id="rows"></tbody>
-      </table>
-    </div>
-  </div>
-
-  <script>
-    let batchId = null;
-    let pollTimer = null;
-
-    function itemHtml() {
-      return `
-      <div class="item">
-        <div class="row">
-          <input type="text" class="category" placeholder="分類名，例如：投資/語言學習/科技新聞" />
-          <button class="btn" onclick="this.closest('.item').remove()">刪除項目</button>
-        </div>
-        <textarea class="urls" placeholder="每行一個網址"></textarea>
-      </div>`;
-    }
-
-    function addItem() {
-      const box = document.getElementById('items');
-      box.insertAdjacentHTML('beforeend', itemHtml());
-    }
-
-    function normalizeStatus(status) {
-      if (!status) return 'pending';
-      return ['pending','extracting','summarizing','completed','error'].includes(status) ? status : 'error';
-    }
-
-    function statusText(status) {
-      const map = {
-        pending: '待處理',
-        extracting: '提取中',
-        summarizing: '整理中',
-        completed: '完成',
-        error: '失敗'
-      };
-      return map[status] || status;
-    }
-
-    function renderTask(task) {
-      const c = task.counts || {};
-      document.getElementById('summary').innerHTML = `
-        <div class="row">
-          <strong>批次 ${task.id}</strong>
-          <span>狀態：${task.status}</span>
-          <span>總數：${c.total || 0}</span>
-          <span style="color:#0369a1;">提取中：${c.extracting || 0}</span>
-          <span style="color:#92400e;">整理中：${c.summarizing || 0}</span>
-          <span style="color:#166534;">完成：${c.completed || 0}</span>
-          <span style="color:#991b1b;">失敗：${c.error || 0}</span>
-        </div>`;
-
-      const rows = (task.items || []).map(item => {
-        const status = normalizeStatus(item.status);
-        return `<tr>
-          <td><span class="tag s-${status}">${statusText(status)}</span></td>
-          <td>${escapeHtml(item.category || '未分類')}</td>
-          <td style="word-break:break-all;">${escapeHtml(item.url || '')}</td>
-          <td>${escapeHtml(item.message || '')}</td>
-        </tr>`;
-      }).join('');
-      document.getElementById('rows').innerHTML = rows;
-    }
-
-    async function startBatch() {
-      const concurrency = Math.max(1, Math.min(3, parseInt(document.getElementById('concurrency').value || '3', 10)));
-      document.getElementById('concurrency').value = String(concurrency);
-      const items = Array.from(document.querySelectorAll('.item')).map(el => {
-        const category = (el.querySelector('.category').value || '').trim();
-        const urls = (el.querySelector('.urls').value || '').split('\\n').map(v => v.trim()).filter(Boolean);
-        return { category, urls };
-      }).filter(i => i.urls.length > 0);
-
-      if (items.length === 0) {
-        alert('請至少新增一個有網址的項目');
-        return;
-      }
-
-      const res = await fetch('/api/batch/start', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ concurrency, items })
-      });
-      const data = await res.json();
-      if (!res.ok || data.error) {
-        alert(data.error || '批次啟動失敗');
-        return;
-      }
-
-      batchId = data.batch_id;
-      if (pollTimer) clearInterval(pollTimer);
-      await pollBatch();
-      pollTimer = setInterval(pollBatch, 2000);
-    }
-
-    async function pollBatch() {
-      if (!batchId) return;
-      const res = await fetch(`/api/batch/${batchId}`);
-      const task = await res.json();
-      if (!res.ok || task.error) return;
-      renderTask(task);
-      if (task.status === 'completed' && pollTimer) {
-        clearInterval(pollTimer);
-        pollTimer = null;
-      }
-    }
-
-    function escapeHtml(s) {
-      return (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-    }
-
-    addItem();
-  </script>
-</body>
-</html>
-'''
-
 # =============================================================================
 # 主程式
 # =============================================================================
@@ -4876,12 +4510,10 @@ def open_browser_later(url: str, delay: float = 1.0):
     threading.Timer(delay, _open).start()
 
 def main():
-    global APP_PORT
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=5000)
     args = parser.parse_args()
-    APP_PORT = args.port
 
     print("=" * 60)
     print("🎬 字幕提取與整理工具 v3.0")
@@ -4903,7 +4535,7 @@ def main():
 
     print(f"\n📁 資料目錄: {DATA_DIR.absolute()}")
 
-    start_worker_pool()
+    start_worker_once()
 
     url = f"http://localhost:{args.port}"
     print(f"\n🚀 啟動中... {url}")
