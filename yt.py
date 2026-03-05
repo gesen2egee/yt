@@ -41,6 +41,20 @@ from pathlib import Path
 from dataclasses import dataclass, field, asdict
 from typing import Optional, List, Dict, Any, Tuple, Set
 
+# 清理會干擾 yt-dlp 的 proxy 環境變數
+PROXY_ENV_KEYS = [
+    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+    "http_proxy", "https_proxy", "all_proxy",
+    "GIT_HTTP_PROXY", "GIT_HTTPS_PROXY",
+    "git_http_proxy", "git_https_proxy",
+]
+
+def env_without_proxy() -> Dict[str, str]:
+    env = os.environ.copy()
+    for k in PROXY_ENV_KEYS:
+        env.pop(k, None)
+    return env
+
 # =============================================================================
 # 自動安裝依賴
 # =============================================================================
@@ -1010,6 +1024,9 @@ def remap_timestamps_in_text(text: str, speed: float, time_map: Dict[str, Any]) 
 class YTDLPProcessor:
     LANG_PRIORITY = ["zh-TW", "zh-Hant", "zh", "zh-CN", "zh-Hans", "en", "ja", "ko"]
 
+    def __init__(self):
+        self.last_audio_error: str = ""
+
     def get_sub_lang_candidates(self, info: dict, max_extra: int = 8) -> List[str]:
         """
         回傳嘗試下載的字幕語言順序：
@@ -1035,7 +1052,10 @@ class YTDLPProcessor:
     def get_video_info(self, url: str) -> dict:
         cmd = ["yt-dlp", "--dump-json", "--no-download", "--no-playlist", "--no-warnings", url]
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60)
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=60, env=env_without_proxy()
+            )
             if result.returncode == 0 and result.stdout.strip():
                 first_line = result.stdout.strip().split('\n')[0]
                 return json.loads(first_line)
@@ -1045,12 +1065,22 @@ class YTDLPProcessor:
 
     def get_playlist_urls(self, url: str) -> List[str]:
         """如果是合輯，展開所有影片網址"""
-        cmd = ["yt-dlp", "--flat-playlist", "--get-id", "--no-warnings", url]
+        cmd = ["yt-dlp", "--flat-playlist", "--print", "%(webpage_url)s", "--no-warnings", url]
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60)
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=60, env=env_without_proxy()
+            )
             if result.returncode == 0:
-                ids = [line.strip() for line in result.stdout.split('\n') if line.strip()]
-                return [f"https://www.youtube.com/watch?v={vid}" for vid in ids]
+                urls = []
+                for line in result.stdout.splitlines():
+                    line = (line or "").strip()
+                    if not line or line in ("NA", "None"):
+                        continue
+                    if line.startswith("http://") or line.startswith("https://"):
+                        urls.append(line)
+                if urls:
+                    return urls
         except Exception as e:
             print(f"解析合輯失敗: {e}")
         return []
@@ -1101,7 +1131,10 @@ class YTDLPProcessor:
 
         try:
             print(f"📝 嘗試下載字幕（語言優先順序: {', '.join(langs[:5])}...）")
-            result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=120, env=env_without_proxy()
+            )
             if result.returncode != 0:
                 print(f"⚠️ yt-dlp 字幕下載返回碼: {result.returncode}")
         except subprocess.TimeoutExpired:
@@ -1135,6 +1168,7 @@ class YTDLPProcessor:
 
     def download_audio(self, url: str, output_dir: Path, title: str, video_id: str, 
                        audio_format: str = "m4a") -> Optional[Path]:
+        self.last_audio_error = ""
         safe_title = sanitize_filename(title)
         output_name = f"{safe_title}_{video_id}"
         output_path = output_dir / f"{output_name}.{audio_format}"
@@ -1164,11 +1198,18 @@ class YTDLPProcessor:
         
         try:
             print(f"📥 開始下載音軌: {title[:50]}...")
-            result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=600)
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=600, env=env_without_proxy()
+            )
             
             # 記錄輸出（用於除錯）
+            had_ytdlp_error = result.returncode != 0
             if result.returncode != 0:
                 print(f"⚠️ yt-dlp 返回碼: {result.returncode}")
+                detail = (result.stderr or result.stdout or "").strip()
+                if detail:
+                    self.last_audio_error = detail[:800]
                 if result.stderr:
                     # 只顯示錯誤訊息的前500字元
                     stderr_preview = result.stderr[:500]
@@ -1208,11 +1249,15 @@ class YTDLPProcessor:
                     return target_file
             else:
                 print(f"❌ 在 {output_dir} 中找不到任何符合的音訊檔案")
+                if not had_ytdlp_error:
+                    self.last_audio_error = f"yt-dlp 完成但找不到輸出檔: {output_name}.*"
                 
         except subprocess.TimeoutExpired:
             print(f"❌ 下載超時（600秒）")
+            self.last_audio_error = "yt-dlp 下載超時（600秒）"
         except Exception as e:
             print(f"❌ 下載音軌失敗: {type(e).__name__}: {e}")
+            self.last_audio_error = f"{type(e).__name__}: {e}"
             import traceback
             traceback.print_exc()
         
@@ -1229,7 +1274,10 @@ class YTDLPProcessor:
             "-o", output_template, url
         ]
         try:
-            subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=1800)
+            subprocess.run(
+                cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=1800, env=env_without_proxy()
+            )
             for f in output_dir.glob(f"{output_name}.*"):
                 if f.suffix.lower() in [".mp4", ".mkv", ".webm"]:
                     return f
@@ -1796,6 +1844,9 @@ class JobProcessor:
             self._refresh_and_check_cancel(job)
 
             if not audio_path:
+                detail = (self.ytdlp.last_audio_error or "").strip()
+                if detail:
+                    raise Exception(f"無法下載音軌: {detail}")
                 raise Exception("無法下載音軌")
 
             job.audio_path = str(audio_path)
@@ -1917,18 +1968,38 @@ def start_worker_pool(worker_count: int = MAX_EXTRACTION_WORKERS):
 def expand_urls_for_jobs(urls: List[str], ytdlp: Optional[YTDLPProcessor] = None) -> List[str]:
     processor = ytdlp or YTDLPProcessor()
     expanded: List[str] = []
+    seen: Set[str] = set()
+
+    def add_unique(u: str):
+        key = (u or "").strip()
+        if not key:
+            return
+        if key in seen:
+            return
+        seen.add(key)
+        expanded.append(key)
+
     for raw in urls:
         url = (raw or "").strip()
         if not url:
             continue
-        if "list=" in url or "/playlist" in url:
+        lowered = url.lower()
+        looks_like_playlist = (
+            "list=" in lowered or
+            "/playlist" in lowered or
+            "playlist?" in lowered or
+            "/sets/" in lowered or
+            "favlist" in lowered
+        )
+        if looks_like_playlist:
             playlist_urls = processor.get_playlist_urls(url)
             if playlist_urls:
-                expanded.extend(playlist_urls)
+                for pu in playlist_urls:
+                    add_unique(pu)
             else:
-                expanded.append(url)
+                add_unique(url)
         else:
-            expanded.append(url)
+            add_unique(url)
     return expanded
 
 def enqueue_job(url: str) -> Job:
@@ -4712,7 +4783,7 @@ BATCH_TEMPLATE = r'''
       </div>
       <div class="row">
         <button class="btn" onclick="addItem()">+ 新增項目</button>
-        <button class="btn btn-primary" onclick="startBatch()">開始批次</button>
+        <button id="start-batch-btn" class="btn btn-primary" onclick="startBatch()">開始批次</button>
       </div>
       <div class="hint">每個項目可填不同分類名。分類會自動加入現有分類，若不存在則自動建立。</div>
       <div id="items"></div>
@@ -4737,6 +4808,7 @@ BATCH_TEMPLATE = r'''
   <script>
     let batchId = null;
     let pollTimer = null;
+    let isStartingBatch = false;
 
     function itemHtml() {
       return `
@@ -4796,11 +4868,13 @@ BATCH_TEMPLATE = r'''
     }
 
     async function startBatch() {
+      if (isStartingBatch) return;
+      const startBtn = document.getElementById('start-batch-btn');
       const concurrency = Math.max(1, Math.min(3, parseInt(document.getElementById('concurrency').value || '3', 10)));
       document.getElementById('concurrency').value = String(concurrency);
       const items = Array.from(document.querySelectorAll('.item')).map(el => {
         const category = (el.querySelector('.category').value || '').trim();
-        const urls = (el.querySelector('.urls').value || '').split('\\n').map(v => v.trim()).filter(Boolean);
+        const urls = (el.querySelector('.urls').value || '').split(/\r?\n/).map(v => v.trim()).filter(Boolean);
         return { category, urls };
       }).filter(i => i.urls.length > 0);
 
@@ -4809,21 +4883,34 @@ BATCH_TEMPLATE = r'''
         return;
       }
 
-      const res = await fetch('/api/batch/start', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ concurrency, items })
-      });
-      const data = await res.json();
-      if (!res.ok || data.error) {
-        alert(data.error || '批次啟動失敗');
-        return;
+      isStartingBatch = true;
+      if (startBtn) {
+        startBtn.disabled = true;
+        startBtn.textContent = '送出中...';
       }
+      try {
+        const res = await fetch('/api/batch/start', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ concurrency, items })
+        });
+        const data = await res.json();
+        if (!res.ok || data.error) {
+          alert(data.error || '批次啟動失敗');
+          return;
+        }
 
-      batchId = data.batch_id;
-      if (pollTimer) clearInterval(pollTimer);
-      await pollBatch();
-      pollTimer = setInterval(pollBatch, 2000);
+        batchId = data.batch_id;
+        if (pollTimer) clearInterval(pollTimer);
+        await pollBatch();
+        pollTimer = setInterval(pollBatch, 2000);
+      } finally {
+        isStartingBatch = false;
+        if (startBtn) {
+          startBtn.disabled = false;
+          startBtn.textContent = '開始批次';
+        }
+      }
     }
 
     async function pollBatch() {
@@ -4854,7 +4941,10 @@ BATCH_TEMPLATE = r'''
 
 def ensure_ytdlp():
     try:
-        result = subprocess.run(["yt-dlp", "--version"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5)
+        result = subprocess.run(
+            ["yt-dlp", "--version"], capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=5, env=env_without_proxy()
+        )
         print(f"✅ yt-dlp: {result.stdout.strip()}")
     except:
         print("❌ yt-dlp 未安裝，正在安裝...")

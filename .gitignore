@@ -11,3 +11,6 @@ venv/
 subtitle_data/
 subtitles/
 date
+tasks/
+reference/
+test/
