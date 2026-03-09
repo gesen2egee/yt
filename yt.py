@@ -1026,6 +1026,32 @@ class YTDLPProcessor:
 
     def __init__(self):
         self.last_audio_error: str = ""
+        self.js_runtime = self._detect_js_runtime()
+
+    @staticmethod
+    def _detect_js_runtime() -> str:
+        for runtime in ("deno", "node", "bun"):
+            if shutil.which(runtime):
+                return runtime
+        return ""
+
+    @staticmethod
+    def _is_youtube_url(url: str) -> bool:
+        return bool(re.search(r"(youtube\.com|youtu\.be)", url or "", re.IGNORECASE))
+
+    def _base_cmd(self, url: str) -> List[str]:
+        cmd = ["yt-dlp"]
+        if self._is_youtube_url(url):
+            cmd.extend([
+                "--cookies-from-browser", "chrome",
+                "--extractor-args", "youtube:player_client=web,default,-tv",
+            ])
+            if self.js_runtime:
+                cmd.extend([
+                    "--js-runtimes", self.js_runtime,
+                    "--remote-components", "ejs:github",
+                ])
+        return cmd
 
     def get_sub_lang_candidates(self, info: dict, max_extra: int = 8) -> List[str]:
         """
@@ -1050,7 +1076,7 @@ class YTDLPProcessor:
         return preferred + others
 
     def get_video_info(self, url: str) -> dict:
-        cmd = ["yt-dlp", "--dump-json", "--no-download", "--no-playlist", "--no-warnings", url]
+        cmd = self._base_cmd(url) + ["--dump-json", "--no-download", "--no-playlist", "--no-warnings", url]
         try:
             result = subprocess.run(
                 cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
@@ -1065,7 +1091,7 @@ class YTDLPProcessor:
 
     def get_playlist_urls(self, url: str) -> List[str]:
         """如果是合輯，展開所有影片網址"""
-        cmd = ["yt-dlp", "--flat-playlist", "--print", "%(webpage_url)s", "--no-warnings", url]
+        cmd = self._base_cmd(url) + ["--flat-playlist", "--print", "%(webpage_url)s", "--no-warnings", url]
         try:
             result = subprocess.run(
                 cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
@@ -1117,8 +1143,7 @@ class YTDLPProcessor:
 
         # 一次下載：人工 + 自動；多語言一次丟
         langs_csv = ",".join(langs)
-        cmd = [
-            "yt-dlp",
+        cmd = self._base_cmd(url) + [
             "--write-subs",
             "--write-auto-subs",
             "--sub-langs", langs_csv,
@@ -1189,9 +1214,9 @@ class YTDLPProcessor:
         if bitrate:
             pp_args += f" -b:a {bitrate}"
 
-        cmd = [
-            "yt-dlp", "-x", "--audio-format", ext,
-            "--no-playlist", "--no-warnings", "--concurrent-fragments", "4",
+        cmd = self._base_cmd(url) + [
+            "-x", "--audio-format", ext,
+            "--no-playlist", "--no-warnings",
             "--postprocessor-args", f"ffmpeg:{pp_args}",
             "-o", str(output_dir / f"{output_name}.%(ext)s"), url
         ]
@@ -1268,8 +1293,8 @@ class YTDLPProcessor:
         output_name = f"{safe_title}_{video_id}"
         output_template = str(output_dir / f"{output_name}.%(ext)s")
 
-        cmd = [
-            "yt-dlp", "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+        cmd = self._base_cmd(url) + [
+            "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
             "--no-playlist", "--no-warnings",
             "-o", output_template, url
         ]
@@ -2009,6 +2034,11 @@ def enqueue_job(url: str) -> Job:
     start_worker_pool()
     return job
 
+def create_job(url: str) -> Job:
+    job = Job(id=str(uuid.uuid4()), url=url, status="queued", stage="等待處理", progress=0)
+    data_manager.add_job(job)
+    return job
+
 def _batch_counts(items: List[Dict[str, Any]]) -> Dict[str, int]:
     return {
         "total": len(items),
@@ -2049,32 +2079,42 @@ def _batch_snapshot(batch_id: str) -> Optional[Dict[str, Any]]:
             "items": [dict(item) for item in task["items"]],
         }
 
-def _run_batch_item(batch_id: str, item: Dict[str, Any]):
+def _extract_batch_item(batch_id: str, item: Dict[str, Any]) -> Optional[Dict[str, str]]:
     item_id = item["id"]
     category = (item.get("category") or "未分類").strip() or "未分類"
     try:
         _batch_update_item(batch_id, item_id, status="extracting", message="")
-        job = enqueue_job(item["url"])
+        job = create_job(item["url"])
         _batch_update_item(batch_id, item_id, job_id=job.id)
-
-        while True:
-            latest = data_manager.get_job(job.id)
-            if not latest:
-                _batch_update_item(batch_id, item_id, status="error", message="找不到工作")
-                return
-            if latest.status in ("completed", "error", "cancelled"):
-                break
-            time.sleep(1.0)
+        job_processor.process_job(job.id)
+        latest = data_manager.get_job(job.id)
+        if not latest:
+            _batch_update_item(batch_id, item_id, status="error", message="找不到工作")
+            return None
 
         if latest.status != "completed":
             _batch_update_item(batch_id, item_id, status="error", message=latest.error_message or latest.status or "提取失敗")
-            return
+            return None
 
         _batch_update_item(batch_id, item_id, status="summarizing", message="")
+        return {
+            "item_id": item_id,
+            "job_id": job.id,
+            "category": category,
+        }
+    except Exception as e:
+        _batch_update_item(batch_id, item_id, status="error", message=str(e))
+        return None
+
+def _summarize_batch_item(batch_id: str, item_meta: Dict[str, str]):
+    item_id = item_meta["item_id"]
+    job_id = item_meta["job_id"]
+    category = item_meta["category"]
+    try:
         task_id = f"batch_{batch_id}_{item_id}_{int(time.time() * 1000)}"
         res = requests.post(
             f"http://127.0.0.1:{APP_PORT}/api/summaries",
-            json={"job_id": job.id, "task_id": task_id},
+            json={"job_id": job_id, "task_id": task_id},
             timeout=7200
         )
         try:
@@ -2103,7 +2143,11 @@ def _run_batch_task(batch_id: str):
         concurrency = int(task.get("concurrency", 3) or 3)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
-        futures = [executor.submit(_run_batch_item, batch_id, item) for item in items]
+        futures = []
+        for item in items:
+            item_meta = _extract_batch_item(batch_id, item)
+            if item_meta:
+                futures.append(executor.submit(_summarize_batch_item, batch_id, item_meta))
         for future in concurrent.futures.as_completed(futures):
             try:
                 future.result()
@@ -2199,8 +2243,12 @@ def get_batch(batch_id):
 def get_config():
     cfg = data_manager.config.copy()
     # 隱藏 API Key 細節
-    cfg["has_gemini_key"] = bool(cfg.get("gemini_api_key"))
-    cfg["has_groq_key"] = bool(cfg.get("groq_api_key"))
+    has_gemini_key = bool(cfg.get("gemini_api_key"))
+    has_groq_key = bool(cfg.get("groq_api_key"))
+    cfg.pop("gemini_api_key", None)
+    cfg.pop("groq_api_key", None)
+    cfg["has_gemini_key"] = has_gemini_key
+    cfg["has_groq_key"] = has_groq_key
     return jsonify(cfg)
 
 @app.route('/api/config', methods=['PUT'])
@@ -2238,6 +2286,21 @@ def update_config():
         except:
             return float(default)
 
+    def to_int(v, default):
+        try:
+            return int(v)
+        except:
+            return int(default)
+
+    def to_bool(v):
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, (int, float)):
+            return bool(v)
+        if isinstance(v, str):
+            return v.strip().lower() in ("1", "true", "yes", "on")
+        return bool(v)
+
     if "llm_audio_speed" in data:
         data_manager.config["llm_audio_speed"] = to_float(data["llm_audio_speed"], 1.5)
     if "silence_noise_db" in data:
@@ -2247,7 +2310,11 @@ def update_config():
     if "long_video_threshold_minutes" in data:
         data_manager.config["long_video_threshold_minutes"] = to_float(data["long_video_threshold_minutes"], 30)
     if "download_video" in data:
-        data_manager.config["download_video"] = bool(data["download_video"])
+        data_manager.config["download_video"] = to_bool(data["download_video"])
+    if "audio_segment_minutes" in data:
+        data_manager.config["audio_segment_minutes"] = max(0, to_int(data["audio_segment_minutes"], 0))
+    if "enable_query_repeat" in data:
+        data_manager.config["enable_query_repeat"] = to_bool(data["enable_query_repeat"])
 
     data_manager._save_data()
     return jsonify({"success": True})
@@ -4968,7 +5035,7 @@ def open_browser_later(url: str, delay: float = 1.0):
 def main():
     global APP_PORT
     parser = argparse.ArgumentParser()
-    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=5000)
     args = parser.parse_args()
     APP_PORT = args.port

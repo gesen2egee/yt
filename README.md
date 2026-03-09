@@ -202,6 +202,8 @@ bash run.sh
   * 你可以到 [Google AI Studio](https://aistudio.google.com/) 免費申請 Gemini API Key。
 * **支援中文影片嗎？**
   * 支援！Gemini 對於中文的理解能力非常好。
+* **YouTube 音軌下載失敗怎麼辦？**
+  * 程式現在會優先使用 Chrome Cookie 協助通過 YouTube 驗證。若你是 Chromium 核心瀏覽器使用者，遇到抓取失敗時，請先完全關閉 Chrome 後再重試。
 
 ## 🛠️ 進階設定
 
